@@ -12,6 +12,7 @@ Platform-specific changes are prefixed with the platform name, otherwise the cha
 - **Dreamcast**: Add pvr palette example [AB]
 - **Dreamcast**: Cleaned up, documented, and enhanced BIOS font API [FG]
 - Rework PVR hybrid mode + IRQ handling [PC]
+- **Dreamcast**: Add support and update toolchain profiles for Newlib 4.5.0, Binutils 2.43.1, and GDB 15.2 [EF]
 
 ## KallistiOS version 2.1.1
 - Added pvrtex utility by TapamN to utils [Daniel Fairchild == DF]
