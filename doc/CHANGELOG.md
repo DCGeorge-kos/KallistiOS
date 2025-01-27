@@ -16,6 +16,7 @@ Platform-specific changes are prefixed with the platform name, otherwise the cha
 - **Dreamcast**: Make m4-single the default floating-point ABI [EF]
 - **Dreamcast**: Add DMAC API [PC]
 - **Dreamcast**: Add basic MMU functionality [PC]
+- **Dreamcast**: Added Raytris raylib example by Niisoks [FG]
 
 ## KallistiOS version 2.1.1
 - Added pvrtex utility by TapamN to utils [Daniel Fairchild == DF]
