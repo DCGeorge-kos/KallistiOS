@@ -7,10 +7,6 @@
 #include <stdio.h>
 #include <stdbool.h>
 
-/* XXX: KallistiOS has the wrong value for the stride bit. */
-#undef PVR_TXRFMT_STRIDE
-#define PVR_TXRFMT_STRIDE BIT(25)
-
 #define SQUARE_SIZE 64
 
 struct square_fcoords {
@@ -157,7 +153,7 @@ static void render_back_buffer_step2(pvr_ptr_t frontbuf, bool hi_chip) {
     float uoffset;
 
     pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY,
-                     PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED | PVR_TXRFMT_STRIDE,
+                     PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED | PVR_TXRFMT_X32_STRIDE,
                      1024, 1024, frontbuf, PVR_FILTER_NEAREST);
 
     if(fbuf_color == 0xffffffff) {
@@ -204,9 +200,8 @@ int main(int argc, char **argv) {
 
     pvr_init_defaults();
 
-    /* Set the stride length for strided textures.
-     * Unit is a set of 32 pixels, hence the /32. */
-    PVR_SET(PVR_TEXTURE_MODULO, 640 / 32);
+    /* Set the stride length for strided textures. */
+    pvr_txr_set_stride(640);
 
     fake_tex = pvr_mem_malloc(sizeof(fake_tex_data));
     pvr_txr_load(fake_tex_data, fake_tex, sizeof(fake_tex_data));
