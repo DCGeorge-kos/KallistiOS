@@ -25,6 +25,7 @@ __BEGIN_DECLS
 #include <stdbool.h>
 
 #include <arch/types.h>
+#include <kos/elf.h>
 
 /** \defgroup arch  Architecture
     \brief          Dreamcast Architecture-Specific Options and high-level API
@@ -33,7 +34,7 @@ __BEGIN_DECLS
 */
 
 /** \brief  Top of memory available, depending on memory size. */
-#ifdef __KOS_GCC_32MB__
+#if defined(__KOS_GCC_32MB__) || __KOS_GCC_PATCHLEVEL__ >= 2025062800
 extern uint32 _arch_mem_top;
 #else
 #pragma message "Outdated toolchain: not patched for 32MB support, limiting "\
@@ -44,7 +45,7 @@ extern uint32 _arch_mem_top;
 
 /** \brief  Start and End address for .text portion of program. */
 extern char _executable_start;
-extern char _etext; 
+extern char _etext;
 
 #define PAGESIZE        4096            /**< \brief Page size (for MMU) */
 #define PAGESIZE_BITS   12              /**< \brief Bits for page size */
@@ -111,6 +112,15 @@ unsigned HZ __depr("Please use the new THD_SCHED_HZ macro.") = THD_SCHED_HZ;
 
 /** \brief  Length of global symbol prefix in ELF files. */
 #define ELF_SYM_PREFIX_LEN  1
+
+/** \brief  ELF class for this architecture. */
+#define ARCH_ELFCLASS       ELFCLASS32
+
+/** \brief  ELF data encoding for this architecture. */
+#define ARCH_ELFDATA        ELFDATA2LSB
+
+/** \brief  ELF machine type code for this architecture. */
+#define ARCH_CODE           EM_SH
 
 /** \brief  Panic function.
 

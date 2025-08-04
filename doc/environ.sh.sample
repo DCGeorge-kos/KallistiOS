@@ -106,6 +106,12 @@ export KOS_LOADER="dc-tool -x"
 #export KOS_LOADER="dc-tool-ip -t 192.168.1.100 -x"
 #export KOS_LOADER="dc-tool-ser -t /dev/ttyS0 -x"
 
+# GDB utility
+#
+# The kos-gdb helper will attempt to auto-detect the proper GDB program
+# to use. You can force it by specifying the path here.
+#export KOS_GDB="sh-elf-gdb"
+
 # Default Compiler Flags
 #
 # Resets build flags. You can also initialize them to some preset
@@ -118,13 +124,14 @@ export KOS_LDFLAGS=""
 export KOS_AFLAGS=""
 export DC_ARM_LDFLAGS=""
 
-# Debug Builds
+# Debug Options
 #
-# Controls whether to disable additional debugging checks and assertions,
-# such as for parameter validation or internal errors. Uncomment this if
-# you do not wish to compile with this additional logic enabled.
+# NDEBUG controls whether to disable `assert` per C standard, and
+# DBGLOG_DISABLED controls whether other debug output will be provided
+# (see ./kos/dbglog.h). Enable these if you want to remove assert checks
+# and disable logging output, as is desirable for release builds.
 #
-#export KOS_CFLAGS="${KOS_CFLAGS} -DNDEBUG"
+#export KOS_CFLAGS="${KOS_CFLAGS} -DNDEBUG -DDBGLOG_DISABLED"
 
 # Optimization Level
 #
