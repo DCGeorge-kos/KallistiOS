@@ -26,6 +26,7 @@
 #include <dc/vmufs.h>
 #include <dc/syscalls.h>
 #include <dc/wdt.h>
+#include <dc/dcload.h>
 
 #include "initall_hdrs.h"
 
@@ -41,6 +42,9 @@ extern void _init(void);
 extern void _fini(void);
 extern void __verify_newlib_patch();
 extern void dma_init(void);
+
+/* Jump back to the bootloader. From startup.S */
+void arch_real_exit(int ret_code) __noreturn;
 
 void (*__kos_init_early_fn)(void) __attribute__((weak,section(".data"))) = NULL;
 
@@ -128,7 +132,7 @@ KOS_INIT_FLAG_WEAK(fs_iso9660_init, true);
 KOS_INIT_FLAG_WEAK(fs_iso9660_shutdown, true);
 
 void dcload_init(void) {
-    if (*DCLOADMAGICADDR == DCLOADMAGICVALUE) {
+    if (syscall_dcload_detected()) {
         dbglog(DBG_INFO, "dc-load console support enabled\n");
         fs_dcload_init();
     }
