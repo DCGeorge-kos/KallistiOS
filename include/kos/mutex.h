@@ -139,25 +139,6 @@ int mutex_destroy(mutex_t *m) __nonnull_all;
     This function will lock a mutex, if it is not already locked by another
     thread. If it is locked by another thread already, this function will block
     until the mutex has been acquired for the calling thread.
-
-    The semantics of this function depend on the type of mutex that is used.
-
-    \param  m               The mutex to acquire
-    \retval 0               On success
-    \retval -1              On error, sets errno as appropriate
-
-    \par    Error Conditions:
-    \em     EPERM - called inside an interrupt \n
-    \em     EAGAIN - lock has been acquired too many times (recursive) \n
-    \em     EDEADLK - would deadlock (error-checking)
-*/
-int mutex_lock(mutex_t *m) __nonnull_all;
-
-/** \brief  Lock a mutex.
-
-    This function will lock a mutex, if it is not already locked by another
-    thread. If it is locked by another thread already, this function will block
-    until the mutex has been acquired for the calling thread.
     This function can be called from within an interrupt context. In that case,
     if the mutex is already locked, an error will be returned.
 
@@ -190,12 +171,33 @@ int mutex_lock_irqsafe(mutex_t *m) __nonnull_all;
 
     \par    Error Conditions:
     \em     EPERM - called inside an interrupt \n
-    \em     EINVAL - the timeout value was invalid (less than 0) \n
     \em     ETIMEDOUT - the timeout expired \n
     \em     EAGAIN - lock has been acquired too many times (recursive) \n
     \em     EDEADLK - would deadlock (error-checking)
 */
-int mutex_lock_timed(mutex_t *m, int timeout) __nonnull_all;
+int mutex_lock_timed(mutex_t *m, unsigned int timeout) __nonnull_all;
+
+/** \brief  Lock a mutex.
+
+    This function will lock a mutex, if it is not already locked by another
+    thread. If it is locked by another thread already, this function will block
+    until the mutex has been acquired for the calling thread.
+
+    The semantics of this function depend on the type of mutex that is used.
+
+    \param  m               The mutex to acquire
+    \retval 0               On success
+    \retval -1              On error, sets errno as appropriate
+
+    \par    Error Conditions:
+    \em     EPERM - called inside an interrupt \n
+    \em     EAGAIN - lock has been acquired too many times (recursive) \n
+    \em     EDEADLK - would deadlock (error-checking)
+*/
+__nonnull_all
+static inline int mutex_lock(mutex_t *m) {
+    return mutex_lock_timed(m, 0);
+}
 
 /** \brief  Check if a mutex is locked.
 
