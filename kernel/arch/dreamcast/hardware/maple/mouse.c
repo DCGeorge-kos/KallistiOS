@@ -10,6 +10,21 @@
 #include <stdint.h>
 #include <assert.h>
 
+/* Mouse center value in the raw condition structure. */
+#define MOUSE_DELTA_CENTER      0x200
+
+/* Raw controller condition structure */
+typedef struct {
+    uint16_t    buttons;
+    uint16_t    dummy1;
+    int16_t     dx;
+    int16_t     dy;
+    int16_t     dz;
+    uint16_t    dummy2;
+    uint32_t    dummy3;
+    uint32_t    dummy4;
+} mouse_cond_t;
+
 static void mouse_reply(maple_state_t *st, maple_frame_t *frm) {
     (void)st;
 
@@ -72,9 +87,7 @@ static maple_driver_t mouse_drv = {
     .functions = MAPLE_FUNC_MOUSE,
     .name = "Mouse Driver",
     .periodic = mouse_periodic,
-    .status_size = sizeof(mouse_state_t),
-    .attach = NULL,
-    .detach = NULL
+    .status_size = sizeof(mouse_state_t)
 };
 
 /* Add the mouse to the driver chain */
