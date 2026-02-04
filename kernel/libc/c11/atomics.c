@@ -10,7 +10,7 @@
 */
 
 #include <kos/irq.h>
-#include <kos/spinlock.h>
+#include <kos/mutex.h>
 #include <arch/arch.h>
 #include <arch/cache.h>
 #include <stdint.h>
@@ -92,21 +92,34 @@
         return ret;  \
     }
 
-/* GCC provides us with all primitive atomics except for 64-bit types. */
-ATOMIC_LOAD_N_(unsigned long long, 8)
-ATOMIC_STORE_N_(unsigned long long, 8)
-ATOMIC_EXCHANGE_N_(unsigned long long, 8)
-ATOMIC_COMPARE_EXCHANGE_N_(unsigned long long, 8)
-ATOMIC_FETCH_N_(unsigned long long, 8, add, +=)
-ATOMIC_FETCH_N_(unsigned long long, 8, sub, -=)
-ATOMIC_FETCH_N_(unsigned long long, 8, and, &=)
-ATOMIC_FETCH_N_(unsigned long long, 8, or, |=)
-ATOMIC_FETCH_N_(unsigned long long, 8, xor, ^=)
-ATOMIC_FETCH_NAND_N_(unsigned long long, 8)
+#define ATOMIC_OPS_N_(type, n) \
+    ATOMIC_LOAD_N_(type, n) \
+    ATOMIC_STORE_N_(type, n) \
+    ATOMIC_EXCHANGE_N_(type, n) \
+    ATOMIC_COMPARE_EXCHANGE_N_(type, n) \
+    ATOMIC_FETCH_N_(type, n, add, +=) \
+    ATOMIC_FETCH_N_(type, n, sub, -=) \
+    ATOMIC_FETCH_N_(type, n, and, &=) \
+    ATOMIC_FETCH_N_(type, n, or, |=) \
+    ATOMIC_FETCH_N_(type, n, xor, ^=) \
+    ATOMIC_FETCH_NAND_N_(type, n)
+
+#if !__has_builtin(__atomic_load_1)
+ATOMIC_OPS_N_(unsigned char, 1)
+#endif
+#if !__has_builtin(__atomic_load_2)
+ATOMIC_OPS_N_(unsigned short, 2)
+#endif
+#if !__has_builtin(__atomic_load_4)
+ATOMIC_OPS_N_(unsigned int, 4)
+#endif
+#if !__has_builtin(__atomic_load_8)
+ATOMIC_OPS_N_(unsigned long long, 8)
+#endif
 
 /* Provide GCC with symbols and logic required to implement
    generically sized atomics. Rather than disabling an enabling
-   interrupts around primitive assignments, we use spinlocks
+   interrupts around primitive assignments, we use mutexes
    around memcpy() calls. */
 
 /* Size of each memory region covered by an individual lock. */
@@ -118,13 +131,13 @@ ATOMIC_FETCH_NAND_N_(unsigned long long, 8)
 #define GENERIC_LOCK_COUNT          (PAGESIZE / GENERIC_LOCK_BLOCK_SIZE)
 
 /* Create a hash table mapping a region of memory to a lock. */
-static spinlock_t locks[GENERIC_LOCK_COUNT] = {
-    [0 ... (GENERIC_LOCK_COUNT - 1)] = SPINLOCK_INITIALIZER
+static mutex_t locks[GENERIC_LOCK_COUNT] = {
+    [0 ... (GENERIC_LOCK_COUNT - 1)] = MUTEX_INITIALIZER
 };
 
 /* Our hash function which maps an address to its corresponding lock index. */
 inline static uintptr_t
-address_to_spinlock(const volatile void *ptr) {
+address_to_mutex(const volatile void *ptr) {
     return ((uintptr_t)ptr / GENERIC_LOCK_BLOCK_SIZE) % GENERIC_LOCK_COUNT;
 }
 
@@ -132,11 +145,11 @@ void __atomic_load(size_t size,
                    const volatile void *ptr,
                    void *ret,
                    int memorder) {
-    const uintptr_t lock = address_to_spinlock(ptr);
+    const uintptr_t lock = address_to_mutex(ptr);
 
     (void)memorder;
 
-    spinlock_lock_scoped(&locks[lock]);
+    mutex_lock_scoped(&locks[lock]);
     memcpy(ret, (const void *)ptr, size);
 }
 
@@ -144,11 +157,11 @@ void __atomic_store(size_t size,
                     volatile void *ptr,
                     void *val,
                     int memorder) {
-    const uintptr_t lock = address_to_spinlock(ptr);
+    const uintptr_t lock = address_to_mutex(ptr);
 
     (void)memorder;
 
-    spinlock_lock_scoped(&locks[lock]);
+    mutex_lock_scoped(&locks[lock]);
     memcpy((void *)ptr, val, size);
 }
 
@@ -157,11 +170,11 @@ void __atomic_exchange(size_t size,
                        void *val,
                        void *ret,
                        int memorder) {
-    const uintptr_t lock = address_to_spinlock(ptr);
+    const uintptr_t lock = address_to_mutex(ptr);
 
     (void)memorder;
 
-    spinlock_lock_scoped(&locks[lock]);
+    mutex_lock_scoped(&locks[lock]);
     memcpy(ret, (const void *)ptr, size);
     memcpy((void *)ptr, val, size);
 }
@@ -172,12 +185,12 @@ bool __atomic_compare_exchange(size_t size,
                                void* desired,
                                int success_memorder,
                                int fail_memorder) {
-    const uintptr_t lock = address_to_spinlock(ptr);
+    const uintptr_t lock = address_to_mutex(ptr);
 
     (void)success_memorder;
     (void)fail_memorder;
 
-    spinlock_lock_scoped(&locks[lock]);
+    mutex_lock_scoped(&locks[lock]);
 
     if(memcmp((const void *)ptr, expected, size) == 0) {
         memcpy((void *)ptr, desired, size);
