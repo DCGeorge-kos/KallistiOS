@@ -39,7 +39,6 @@ something like this:
 #include <kos/thread.h>
 #include <kos/mutex.h>
 #include <kos/nmmgr.h>
-#include <kos/dbgio.h>
 #include <kos/dbglog.h>
 
 /* File handle structure; this is an entirely internal structure so it does
@@ -195,7 +194,7 @@ static int fs_hnd_assign(fs_hnd_t *hnd) {
 
     fs_hnd_ref(hnd);
 
-    for(i = 0; i < FD_SETSIZE; i++) {
+    for(i = 3; i < FD_SETSIZE; i++) {
         fs_hnd_t *old = NULL;
 
         if(atomic_compare_exchange_strong(&fd_table[i], &old, hnd))
@@ -310,6 +309,9 @@ file_t fs_dup2(file_t oldfd, file_t newfd) {
         return -1;
     }
 
+    if(oldfd == newfd)
+        goto out_get_ref;
+
     do {
         prev = fd_table[newfd];
         if(prev) {
@@ -320,6 +322,7 @@ file_t fs_dup2(file_t oldfd, file_t newfd) {
     } while(!atomic_compare_exchange_strong(&fd_table[newfd],
                                             &prev, fd_table[oldfd]));
 
+out_get_ref:
     fs_hnd_ref(fd_table[newfd]);
 
     return newfd;
