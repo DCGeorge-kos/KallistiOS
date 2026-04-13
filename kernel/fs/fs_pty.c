@@ -450,53 +450,6 @@ static int pty_close(void *h) {
     return 0;
 }
 
-/* Read from a pty endpoint, kernel console special case */
-static ssize_t pty_read_serial(pipefd_t *fdobj, ptyhalf_t *ph, void *buf, size_t bytes) {
-    int c, r = 0;
-
-    (void)ph;
-
-    while(bytes > 0) {
-    again:
-        /* Try to read a char */
-        c = dbgio_read();
-
-        /* Get anything? */
-        if(c == -1) {
-            /* If we are in non-block, we give up now */
-            if(fdobj->mode & O_NONBLOCK) {
-                if(r == 0) {
-                    errno = EAGAIN;
-                    r = -1;
-                }
-
-                break;
-            }
-
-            /* Have we read anything at all? */
-            if(r == 0) {
-                /* Nope -- sleep a bit and try again */
-                thd_sleep(10);
-                goto again;
-            }
-            else
-                /* Yep -- that's enough */
-                break;
-        }
-
-        /* Add the obtained char to the buffer and echo it */
-        ((uint8_t *)buf)[r] = c;
-        dbgio_write(c);
-        r++;
-    }
-
-    /* Flush any remaining echoed chars */
-    dbgio_flush();
-
-    /* Return the number we got */
-    return r;
-}
-
 /* Read from a pty endpoint */
 static ssize_t pty_read(void *h, void *buf, size_t bytes) {
     size_t avail;
@@ -512,8 +465,9 @@ static ssize_t pty_read(void *h, void *buf, size_t bytes) {
     }
 
     /* Special case the unattached console */
-    if(ph->id == 0 && !ph->master && ph->other->refcnt == 0)
-        return pty_read_serial(fdobj, ph, buf, bytes);
+    if(ph->id == 0 && !ph->master && ph->other->refcnt == 0) {
+        return dbgio_read_buffer((uint8_t *)buf, bytes);
+    }
 
     /* Lock the ptyhalf */
     mutex_lock(&ph->mutex);
@@ -799,8 +753,8 @@ static int pty_fstat(void *h, struct stat *st) {
 
     memset(st, 0, sizeof(struct stat));
     st->st_dev = (dev_t)('p' | ('t' << 8) | ('y' << 16));
-    st->st_mode = (fd->mode & O_DIR) ? 
-        (S_IFDIR | S_IRWXU | S_IRWXG | S_IRWXO) : 
+    st->st_mode = (fd->mode & O_DIR) ?
+        (S_IFDIR | S_IRWXU | S_IRWXG | S_IRWXO) :
         (S_IFCHR | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
     st->st_size = (fd->mode & O_DIR) ? -1 : (off_t)fd->d.p->cnt;
     st->st_blksize = (fd->mode & O_DIR) ? 0 : 1;
