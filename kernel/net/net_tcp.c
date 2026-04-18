@@ -134,6 +134,14 @@ struct rcvrec {
     uint32_t irs;
 };
 
+/* Out-of-order segment table for TCP reassembly */
+#define TCP_OOO_MAX 32
+
+struct tcp_ooo_seg {
+    uint32_t seq;
+    uint16_t len;
+};
+
 struct tcp_sock {
     LIST_ENTRY(tcp_sock) sock_list;
     struct sockaddr_in6 local_addr;
@@ -174,6 +182,9 @@ struct tcp_sock {
             uint64_t timer;
             condvar_t send_cv;
             condvar_t recv_cv;
+            struct tcp_ooo_seg ooo[TCP_OOO_MAX];
+            int ooo_count;
+            uint8_t ack_pending;    /* segments since last ACK */
         } data;
     };
 };
@@ -184,9 +195,10 @@ static struct tcp_sock_list tcp_socks = LIST_HEAD_INITIALIZER(0);
 static rw_semaphore_t tcp_sem = RWSEM_INITIALIZER;
 static int thd_cb_id = 0;
 
-/* Default starting window size for connections. This should be big enough as a
-   starting point, in general. If you need to adjust it, you can do so... */
-#define TCP_DEFAULT_WINDOW  8192
+/* Default starting window size for connections. Must fit in uint16_t (max
+   65535 without RFC 1323 window scaling). Larger = more in-flight data =
+   better throughput on links with any latency or reordering. */
+#define TCP_DEFAULT_WINDOW  65535
 
 /* Default MSS */
 #define TCP_DEFAULT_MSS     1460
@@ -842,9 +854,10 @@ static int net_tcp_bind(net_socket_t *hnd, const struct sockaddr *addr,
         sock->local_addr = realaddr6;
     }
     else {
-        uint16_t port = 1024, tmp = 0;
+        static uint16_t next_bind_ephemeral = 1024;
+        uint16_t port = next_bind_ephemeral, tmp = 0;
 
-        /* Grab the first unused port >= 1024. This is, unfortunately, O(n^2) */
+        /* Grab the first unused port >= next_bind_ephemeral. */
         while(tmp != port) {
             tmp = port;
 
@@ -858,8 +871,10 @@ static int net_tcp_bind(net_socket_t *hnd, const struct sockaddr *addr,
                     return -1;
                 }
 
-                if(iter->local_addr.sin6_port == port) {
+                if(iter->local_addr.sin6_port == htons(port)) {
+                    mutex_unlock(&iter->mutex);
                     ++port;
+                    if(port > 65000) port = 1024;
                     break;
                 }
 
@@ -869,6 +884,8 @@ static int net_tcp_bind(net_socket_t *hnd, const struct sockaddr *addr,
 
         sock->local_addr = realaddr6;
         sock->local_addr.sin6_port = htons(port);
+        next_bind_ephemeral = port + 1;
+        if(next_bind_ephemeral > 65000) next_bind_ephemeral = 1024;
     }
 
     /* Release the locks, we're done */
@@ -973,7 +990,8 @@ static int net_tcp_connect(net_socket_t *hnd, const struct sockaddr *addr,
 
     /* See if the socket is already bound to a local port */
     if(!sock->local_addr.sin6_port) {
-        uint16_t port = 1024, tmp = 0;
+        static uint16_t next_ephemeral = 1024;
+        uint16_t port = next_ephemeral, tmp = 0;
 
         /* Grab the first unused port >= 1024. This is, unfortunately, O(n^2) */
         while(tmp != port) {
@@ -989,7 +1007,8 @@ static int net_tcp_connect(net_socket_t *hnd, const struct sockaddr *addr,
                     return -1;
                 }
 
-                if(iter->local_addr.sin6_port == port) {
+                if(iter->local_addr.sin6_port == htons(port)) {
+                    mutex_unlock(&iter->mutex);
                     ++port;
                     break;
                 }
@@ -999,6 +1018,8 @@ static int net_tcp_connect(net_socket_t *hnd, const struct sockaddr *addr,
         }
 
         sock->local_addr.sin6_port = htons(port);
+        next_ephemeral = port + 1;
+        if(next_ephemeral > 65000) next_ephemeral = 1024;
 
         if(addr->sa_family == AF_INET) {
             sock->local_addr.sin6_addr.__s6_addr.__s6_addr16[5] = 0xFFFF;
@@ -1254,8 +1275,25 @@ static ssize_t net_tcp_recvfrom(net_socket_t *hnd, void *buffer, size_t length,
 
     /* Advance the window if we're pulling data out of the queue. */
     if(!(flags & MSG_PEEK)) {
+        uint32_t old_wnd = sock->data.rcv.wnd;
         sock->data.rcv.wnd += size;
         sock->data.rcvbuf_cur_sz -= size;
+
+        /* BUG FIX: When the receive window was zero, the sender has
+           entered TCP persist mode (zero-window probing). We must send
+           a window-update ACK so it knows the window has reopened.
+           Without this, the sender never learns and the connection
+           deadlocks permanently. */
+        if(old_wnd == 0 && sock->data.rcv.wnd > 0) {
+            tcp_send_ack(sock);
+        }
+        /* Flush any pending delayed ACK now that the app has read.
+           This gets the ACK out immediately instead of waiting up to
+           10ms for the timer, reducing effective RTT significantly. */
+        else if(sock->data.ack_pending > 0) {
+            tcp_send_ack(sock);
+            sock->data.ack_pending = 0;
+        }
     }
 
     if(sock->data.rcvbuf_head + size <= sock->rcvbuf_sz) {
@@ -1277,8 +1315,11 @@ static ssize_t net_tcp_recvfrom(net_socket_t *hnd, void *buffer, size_t length,
             sock->data.rcvbuf_head = size - tmp;
     }
 
-    /* If we've got nothing left, move the pointers back to the beginning */
-    if(!sock->data.rcvbuf_cur_sz) {
+    /* If we've got nothing left, move the pointers back to the beginning.
+       But NOT if there are OOO segments buffered — their data was placed
+       at offsets relative to the current tail. Resetting tail to 0 would
+       make tcp_ooo_consume look for data at the wrong position. */
+    if(!sock->data.rcvbuf_cur_sz && !sock->data.ooo_count) {
         sock->data.rcvbuf_head = sock->data.rcvbuf_tail = 0;
     }
 
@@ -2187,8 +2228,8 @@ static void tcp_send_data(struct tcp_sock *sock, int resend) {
         sb = sock->data.sndbuf + head;
         snd = wnd;
 
-        if(snd > sock->data.snd.mss - sizeof(tcp_hdr_t))
-            snd = sock->data.snd.mss - sizeof(tcp_hdr_t);
+        if(snd > sock->data.snd.mss)
+            snd = sock->data.snd.mss;
 
         if(snd > sock->data.sndbuf_cur_sz - unacked)
             snd = sock->data.sndbuf_cur_sz - unacked;
@@ -2480,6 +2521,76 @@ static int synsent_pkt(netif_t *src, const struct in6_addr *srca,
     return 0;
 }
 
+/* Buffer an out-of-order segment: copy data to the correct offset in
+   the circular receive buffer, and record the range in the OOO table. */
+/* Returns 0 on success, -1 if table is full (data NOT buffered). */
+static int tcp_ooo_add(struct tcp_sock *s, uint32_t seq, size_t sz,
+                        const uint8_t *data) {
+    if(s->data.ooo_count >= TCP_OOO_MAX)
+        return -1;
+
+    /* Reject duplicates — if this segment overlaps with an existing
+       OOO entry, skip it. Without this check, retransmitted OOO
+       segments decrement rcv.wnd repeatedly, eventually leaking
+       the window to zero and deadlocking the connection. */
+    for(int i = 0; i < s->data.ooo_count; i++) {
+        uint32_t ooo_end = s->data.ooo[i].seq + s->data.ooo[i].len;
+        if(SEQ_GE(seq, s->data.ooo[i].seq) && SEQ_LT(seq, ooo_end))
+            return -1;
+    }
+
+    /* Place data at correct offset in the circular buffer */
+    uint32_t gap = (uint32_t)(seq - s->data.rcv.nxt);
+    uint32_t offset = (s->data.rcvbuf_tail + gap) % s->rcvbuf_sz;
+
+    if(offset + sz <= s->rcvbuf_sz) {
+        memcpy(s->data.rcvbuf + offset, data, sz);
+    }
+    else {
+        uint32_t first = s->rcvbuf_sz - offset;
+        memcpy(s->data.rcvbuf + offset, data, first);
+        memcpy(s->data.rcvbuf, data + first, sz - first);
+    }
+
+    s->data.ooo[s->data.ooo_count].seq = seq;
+    s->data.ooo[s->data.ooo_count].len = (uint16_t)sz;
+    s->data.ooo_count++;
+    return 0;
+}
+
+/* After an in-order segment advances rcv.nxt, check if any buffered
+   OOO segments are now contiguous and can be consumed. Returns total
+   additional bytes consumed (data already in the buffer). */
+static uint32_t tcp_ooo_consume(struct tcp_sock *s) {
+    uint32_t total = 0;
+    int changed;
+
+    do {
+        changed = 0;
+        for(int i = 0; i < s->data.ooo_count; i++) {
+            uint32_t seg_end = s->data.ooo[i].seq + s->data.ooo[i].len;
+
+            /* Stale entry (behind rcv.nxt) — remove */
+            if(SEQ_LE(seg_end, s->data.rcv.nxt)) {
+                s->data.ooo[i] = s->data.ooo[--s->data.ooo_count];
+                changed = 1;
+                break;
+            }
+
+            /* Contiguous — consume */
+            if(s->data.ooo[i].seq == s->data.rcv.nxt) {
+                total += s->data.ooo[i].len;
+                s->data.rcv.nxt += s->data.ooo[i].len;
+                s->data.ooo[i] = s->data.ooo[--s->data.ooo_count];
+                changed = 1;
+                break;
+            }
+        }
+    } while(changed);
+
+    return total;
+}
+
 /* This implements the processing described for the synchronized states, as
    described in pages 69-76 of the RFC. */
 static int process_pkt(netif_t *src, const struct in6_addr *srca,
@@ -2512,6 +2623,9 @@ static int process_pkt(netif_t *src, const struct in6_addr *srca,
                 bad_pkt = 1;
         }
         else {
+            /* Accept data segments anywhere in [rcv.nxt, rcv.nxt+wnd).
+               In-order segments (seq == rcv.nxt) go straight to the app.
+               Out-of-order segments are buffered for reassembly. */
             if(!(SEQ_GE(seq, s->data.rcv.nxt) &&
                     SEQ_LT(seq, s->data.rcv.nxt + s->data.rcv.wnd)))
                 bad_pkt = 1;
@@ -2665,28 +2779,70 @@ static int process_pkt(netif_t *src, const struct in6_addr *srca,
 
         /* Copy the data out */
         if(sz) {
-            rb = s->data.rcvbuf + s->data.rcvbuf_tail;
-            s->data.rcv.nxt += sz;
-            s->data.rcv.wnd -= sz;
-            s->data.rcvbuf_cur_sz += sz;
+            if(seq == s->data.rcv.nxt) {
+                /* --- In-order segment: deliver to app buffer --- */
+                rb = s->data.rcvbuf + s->data.rcvbuf_tail;
+                s->data.rcv.nxt += sz;
+                s->data.rcv.wnd -= sz;
+                s->data.rcvbuf_cur_sz += sz;
 
-            if(s->data.rcvbuf_tail + sz <= s->rcvbuf_sz) {
-                memcpy(rb, buf, sz);
-                s->data.rcvbuf_tail += sz;
-            }
-            else {
-                tmp = s->rcvbuf_sz - s->data.rcvbuf_tail;
-                memcpy(rb, buf, tmp);
-                sz -= tmp;
-                buf += tmp;
-                memcpy(s->data.rcvbuf, buf, sz);
-                s->data.rcvbuf_tail = sz;
-            }
+                if(s->data.rcvbuf_tail + sz <= s->rcvbuf_sz) {
+                    memcpy(rb, buf, sz);
+                    s->data.rcvbuf_tail += sz;
+                }
+                else {
+                    tmp = s->rcvbuf_sz - s->data.rcvbuf_tail;
+                    memcpy(rb, buf, tmp);
+                    memcpy(s->data.rcvbuf, buf + tmp, sz - tmp);
+                    s->data.rcvbuf_tail = sz - tmp;
+                }
 
-            /* Signal any waiting thread and send an ack for what we read */
-            __poll_event_trigger(s->sock, POLLRDNORM);
-            cond_signal(&s->data.recv_cv);
-            tcp_send_ack(s);
+                /* Check if buffered OOO segments are now contiguous */
+                uint32_t extra = 0;
+                if(s->data.ooo_count > 0) {
+                    extra = tcp_ooo_consume(s);
+                    if(extra) {
+                        /* Data already in buffer from when OOO arrived.
+                           Advance tail and cur_sz. rcv.wnd was already
+                           decremented when the OOO segment was buffered,
+                           and rcv.nxt was advanced by tcp_ooo_consume. */
+                        s->data.rcvbuf_cur_sz += extra;
+                        s->data.rcvbuf_tail =
+                            (s->data.rcvbuf_tail + extra) % s->rcvbuf_sz;
+                    }
+                }
+
+                __poll_event_trigger(s->sock, POLLRDNORM);
+                cond_signal(&s->data.recv_cv);
+
+                /* Delayed ACK: ACK every 2nd in-order segment to
+                   reduce TX load on the RX thread (each ACK TX takes
+                   ~150us during which RX is blocked, risking RTL8139
+                   buffer overflow). Pending ACKs are flushed by the
+                   10ms timer in tcp_thd_cb. Also ACK immediately
+                   after consuming OOO segments (big jump in rcv.nxt
+                   tells the sender to stop retransmitting). */
+                s->data.ack_pending++;
+                if(s->data.ack_pending >= 8 || extra > 0) {
+                    tcp_send_ack(s);
+                    s->data.ack_pending = 0;
+                }
+            }
+            else if(SEQ_GT(seq, s->data.rcv.nxt)) {
+                /* --- Out-of-order segment: buffer for reassembly --- */
+                if(tcp_ooo_add(s, seq, sz, buf) == 0) {
+                    /* Only shrink window if data was actually buffered.
+                       If table was full, data was dropped — don't account
+                       for phantom bytes or the app gets garbage later. */
+                    s->data.rcv.wnd -= sz;
+                }
+
+                /* Send dup ACK (with current rcv.nxt) so the sender
+                   can do fast retransmit after 3 dup ACKs. */
+                tcp_send_ack(s);
+            }
+            /* else: seq < rcv.nxt — duplicate/retransmit, ignore data.
+               The ACK sent for bad_pkt (if any) covers this. */
         }
     }
     else if(sz) {
@@ -2888,6 +3044,13 @@ static void tcp_thd_cb(void *arg) {
             case TCP_STATE_ESTABLISHED:
             case TCP_STATE_CLOSE_WAIT:
 
+                /* Flush pending delayed ACK. Without this, a single
+                   unACKed segment stalls the sender indefinitely. */
+                if(i->data.ack_pending > 0) {
+                    tcp_send_ack(i);
+                    i->data.ack_pending = 0;
+                }
+
                 if(i->data.sndbuf_cur_sz &&
                         i->data.timer + TCP_DEFAULT_RTTO <= timer) {
                     tcp_send_data(i, 1);
@@ -2961,7 +3124,7 @@ static fs_socket_proto_t proto = {
 };
 
 int net_tcp_init(void) {
-    if((thd_cb_id = net_thd_add_callback(tcp_thd_cb, NULL, 50)) < 0)
+    if((thd_cb_id = net_thd_add_callback(tcp_thd_cb, NULL, 10)) < 0)
         return -1;
 
     return fs_socket_proto_add(&proto);

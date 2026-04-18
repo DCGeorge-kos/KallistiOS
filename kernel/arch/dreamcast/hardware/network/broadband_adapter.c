@@ -9,6 +9,7 @@
  */
 
 #include <stdalign.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
@@ -24,17 +25,17 @@
 #include <kos/net.h>
 #include <kos/thread.h>
 #include <kos/sem.h>
+#include <kos/worker_thread.h>
 
 /* Configuration definitions */
 
 #define RTL_MEM                 (0x1840000)
 
-#define RX_NOWRAP               1 /* Default to no wrapping */
 #define RX_BUFFER_SHIFT         1 /* 0 : 8Kb, 1 : 16Kb, 2 : 32Kb, 3 : 64Kb */
 
 #define RX_CONFIG_DEFAULT       (RT_ERTH(0) | RT_RXC_RXFTH(0) | \
                                 RT_RXC_RBLEN(RX_BUFFER_SHIFT) | RT_RXC_MXDMA(6) | \
-                                (RX_NOWRAP ? RT_RXC_WRAP : 0))
+                                RT_RXC_WRAP)
 
 #define RX_BUFFER_LEN           (0x2000 << RX_BUFFER_SHIFT)
 
@@ -226,7 +227,7 @@ static uint32_t const txdesc[TX_NB_BUFFERS] = {
 };
 
 /* Is the link stabilized? */
-static volatile int link_stable;
+static bool link_stable;
 
 /* Receive callback */
 static eth_rx_callback_t eth_rx_callback;
@@ -244,19 +245,17 @@ void bba_set_rx_callback(eth_rx_callback_t cb) {
     eth_rx_callback = cb;
 }
 
-static int rtl_reset(void) {
-    int i = 100;
+static int rtl_is_ready(void *d) {
+    (void)d;
+    return !(g2_read_8(NIC(RT_CHIPCMD)) & RT_CMD_RESET);
+}
 
+static int rtl_reset(void) {
     /* Soft-reset the chip */
     g2_write_8(NIC(RT_CHIPCMD), RT_CMD_RESET);
 
     /* Wait for it to come back */
-    while((g2_read_8(NIC(RT_CHIPCMD)) & RT_CMD_RESET) && i > 0) {
-        i--;
-        thd_sleep(10);
-    }
-
-    if(g2_read_8(NIC(RT_CHIPCMD)) & RT_CMD_RESET) {
+    if(!thd_poll(rtl_is_ready, NULL, 1000)) {
         dbglog(DBG_ERROR, "bba: timed out on reset\n");
         return -1;
     }
@@ -271,7 +270,7 @@ static int rtl_reset(void) {
 static int bba_hw_init(void) {
     uint32_t tmp;
 
-    link_stable = 0;
+    link_stable = false;
 
     /* Initialize GAPS */
     if(gaps_init() < 0)
@@ -426,45 +425,11 @@ static void bba_hw_shutdown(void) {
     asic_evt_remove_handler(ASIC_EVT_EXP_PCI);
 }
 
-static void g2_read_block_8_fast(uint8_t *dst, uint8_t *src, int len) {
-    if(len <= 0)
-        return;
-
-    g2_lock_scoped();
-
-    uint32_t *d = (uint32_t *) dst;
-    uint32_t *s = (uint32_t *) src;
-    len = (len + 3) >> 2;
-
-    while(len & 7) {
-        *d++ = *s++;
-        --len;
-    }
-
-    if(len > 0) {
-
-        len >>= 3;
-
-        do {
-            d[0] = *s++;
-            d[1] = *s++;
-            d[2] = *s++;
-            d[3] = *s++;
-            d[4] = *s++;
-            d[5] = *s++;
-            d[6] = *s++;
-            d[7] = *s++;
-            d += 8;
-        }
-        while(--len);
-    }
-}
-
-
 #define RXBSZ    (64*1024) /* must be a power of two */
 #define MAX_PKTS (RXBSZ / 32)
 static struct pkt {
-    int pkt_size;
+    uint16_t pkt_size;
+    uint16_t offt;
     uint8_t *rxbuff;
 } rx_pkt[MAX_PKTS];
 
@@ -476,11 +441,6 @@ static int dma_used;
 
 static uint32_t rx_size;
 
-static kthread_t * bba_rx_thread;
-static semaphore_t bba_rx_sema;
-static int bba_rx_exit_thread;
-static semaphore_t bba_rx_sema2;
-
 static void bba_rx(void);
 
 static semaphore_t tx_sema;
@@ -489,6 +449,8 @@ static uint8_t *next_dst;
 static uint8_t *next_src;
 static int next_len;
 
+static kthread_worker_t *rx_worker;
+
 static void rx_finish_enq(int room) {
     /* Tell the chip where we are for overflow checking */
     rtl.cur_rx = (rtl.cur_rx + rx_size + 4 + 3) & ~3;
@@ -496,7 +458,7 @@ static void rx_finish_enq(int room) {
 
     if(room > 0 && (((rxin + 1) % MAX_PKTS) != rxout)) {
         rxin = (rxin + 1) % MAX_PKTS;
-        sem_signal(&bba_rx_sema);
+        thd_worker_wakeup(rx_worker);
         thd_schedule(true);
     }
 }
@@ -520,28 +482,20 @@ static void bba_dma_cb(void *p) {
     }
 }
 
-static int bba_copy_dma(uint8_t *dst, uint32_t s, int len) {
+static int bba_copy_packet(uint8_t *dst, uint32_t s, int len) {
     uint8_t *src = (uint8_t *) s;
 
-    if(len <= 0)
-        return 1;
+    assert(__is_aligned((uintptr_t)dst, 32));
+    assert(__is_aligned(s, 32));
+    assert(__is_aligned(len, 32));
 
-    if(len > DMA_THRESHOLD && !irq_inside_int()) {
-        uint32_t add;
-
-        /*
-           This way all will be nicely 32 bytes aligned (assuming that dst and src have
-           same alignment initially and that we don't care about the beginning of dst
-           buffer)
-        */
-        add = ((uint32_t) src) & 31;
-        len += add;
-        src -= add;
-        dst -= add;
-
+    if(len > DMA_THRESHOLD) {
         /* Invalidate the dcache over the range of the data. */
         if(!__is_defined(USE_P2_AREA))
             dcache_inval_range((uint32_t) dst, len);
+
+        /* Prevent racing against the callback */
+        irq_disable_scoped();
 
         if(!dma_used) {
             dma_used = 1;
@@ -549,6 +503,10 @@ static int bba_copy_dma(uint8_t *dst, uint32_t s, int len) {
                             bba_dma_cb, 0,  /* callback */
                             1,  /* dir = 1, we're *reading* from the g2 bus */
                             0, G2_DMA_CHAN_BBA, 0);
+        }
+        else if(next_len) {
+            /* RX DMA is really busy - notify that we couldn't read the packet */
+            return -1;
         }
         else {
             next_dst = dst;
@@ -559,77 +517,85 @@ static int bba_copy_dma(uint8_t *dst, uint32_t s, int len) {
         return 0;
     }
     else {
-        g2_read_block_8_fast(dst, src, len);
+        g2_read_block_32((uint32_t *)dst, (uint32_t)src, len >> 2);
         return !dma_used;
     }
 }
 
-/* Utility function to copy out a some data from the ring buffer into an SH-4
-   buffer. This is done to make sure the buffers don't overflow. */
-/* XXX Could probably use a memcpy8 here, even */
-static int  bba_copy_packet(uint8_t *dst, uint32_t src, int len) {
-
-    if(__is_defined(RX_NOWRAP) || (src + len) < RX_BUFFER_LEN) {
-        /* Straight copy is ok */
-        return bba_copy_dma(dst, rtl_mem + src, len);
-    }
-    else {
-        /* Have to copy around the ring end */
-        bba_copy_dma(dst, rtl_mem + src, RX_BUFFER_LEN - src);
-
-        return bba_copy_dma(dst + (RX_BUFFER_LEN - src),
-                            rtl_mem, len - (RX_BUFFER_LEN - src));
-    }
+/* Compute the difference between the read head and the write head in a circular buffer */
+static inline unsigned int ptr_diff(const uint8_t *rd, const uint8_t *wr, size_t len) {
+    return (len + (uintptr_t)rd - (uintptr_t)wr) % len;
 }
 
 static int rx_enq(int ring_offset, size_t pkt_size) {
+    size_t aligned_size;
+    uint16_t offt;
+
     /* If there's no one to receive it, don't bother. */
-    if(eth_rx_callback) {
-        if(rxin != rxout &&
-                (((rx_pkt[rxout].rxbuff - (rxbuff + 32)) - rxbuff_pos) & (RXBSZ - 1)) < pkt_size + 2048) {
-            return -1;
-        }
+    if(!eth_rx_callback)
+        return -1;
 
-        /* Receive buffer: temporary space to copy out received data */
+    offt = ring_offset & 0x1f;
+    aligned_size = __align_up(pkt_size + offt, 32);
 
-        if(__is_defined(USE_P2_AREA))
-            rx_pkt[rxin].rxbuff = rxbuff + 32 + (rxbuff_pos | MEM_AREA_P2_BASE) + (ring_offset & 31);
-        else
-            rx_pkt[rxin].rxbuff = rxbuff + 32 + rxbuff_pos + (ring_offset & 31);
-
-        rxbuff_pos = (rxbuff_pos + pkt_size + 63) & (RXBSZ - 32);
-
-        rx_pkt[rxin].pkt_size = pkt_size;
-        return bba_copy_packet(rx_pkt[rxin].rxbuff, ring_offset, pkt_size);
+    /* Do we have space for it? */
+    if(rxin != rxout
+       && ptr_diff(rx_pkt[rxout].rxbuff, &rxbuff[rxbuff_pos], RXBSZ) < aligned_size) {
+        dbglog(DBG_WARNING, "No space in RX buffer\n");
+        return -1;
     }
-    else
-        return 1;
+
+    /* Get a pointer to the receive buffer where we will store the packet */
+    rx_pkt[rxin].rxbuff = &rxbuff[rxbuff_pos];
+    if(__is_defined(USE_P2_AREA))
+        rx_pkt[rxin].rxbuff = (void *)(((uintptr_t)rx_pkt[rxin].rxbuff) | MEM_AREA_P2_BASE);
+
+    rx_pkt[rxin].pkt_size = pkt_size;
+    rx_pkt[rxin].offt = offt;
+
+    rxbuff_pos += aligned_size;
+    if(rxbuff_pos >= RXBSZ)
+        rxbuff_pos = 0;
+
+    return bba_copy_packet(rx_pkt[rxin].rxbuff,
+                           rtl_mem + (ring_offset & ~0x1f), aligned_size);
+}
+
+static int bba_link_is_stable(void *d) {
+    return *(int *)d;
+}
+
+static int bba_can_tx(void *d) {
+    (void)d;
+
+    if(!(g2_read_32(NIC(RT_TXSTATUS0 + 4 * rtl.cur_tx)) & RT_TX_HOST_OWNS)) {
+        if(g2_read_32(NIC(RT_TXSTATUS0 + 4 * rtl.cur_tx)) & RT_TX_ABORTED)
+            g2_write_32(NIC(RT_TXSTATUS0 + 4 * rtl.cur_tx),
+                        g2_read_32(NIC(RT_TXSTATUS0 + 4 * rtl.cur_tx)) | 1);
+        return 0;
+    }
+
+    return 1;
 }
 
 /* Transmit a single packet */
 static int bba_rtx(const uint8_t *pkt, int len, int wait)
 {
-    if(!link_stable) {
-        if(wait == BBA_TX_WAIT) {
-            while(!link_stable)
-                ;
-        }
-        else
-            return BBA_TX_AGAIN;
+    if(wait == BBA_TX_WAIT) {
+        assert(!irq_inside_int());
+
+        if(!link_stable)
+            thd_poll(bba_link_is_stable, &link_stable, 0);
+    } else if(!link_stable) {
+        return BBA_TX_AGAIN;
     }
 
     /* Wait till it's clear to transmit */
     if(wait == BBA_TX_WAIT) {
-        while(!(g2_read_32(NIC(RT_TXSTATUS0 + 4 * rtl.cur_tx)) & RT_TX_HOST_OWNS)) {
-            if(g2_read_32(NIC(RT_TXSTATUS0 + 4 * rtl.cur_tx)) & RT_TX_ABORTED)
-                g2_write_32(NIC(RT_TXSTATUS0 + 4 * rtl.cur_tx),
-                            g2_read_32(NIC(RT_TXSTATUS0 + 4 * rtl.cur_tx)) | 1);
-        }
+        thd_poll(bba_can_tx, NULL, 0);
     }
-    else {
-        if(!(g2_read_32(NIC(RT_TXSTATUS0 + 4 * rtl.cur_tx)) & RT_TX_HOST_OWNS)) {
-            return BBA_TX_AGAIN;
-        }
+    else if(!(g2_read_32(NIC(RT_TXSTATUS0 + 4 * rtl.cur_tx)) & RT_TX_HOST_OWNS)) {
+        return BBA_TX_AGAIN;
     }
 
     /* Copy the packet out to RTL memory */
@@ -637,18 +603,8 @@ static int bba_rtx(const uint8_t *pkt, int len, int wait)
 
     //g2_write_block_8(pkt, txdesc[rtl.cur_tx], len);
 
-    /* Check alignment of the packet, if its 32-bit aligned, use
-       g2_write_block_32, if its 16-bit aligned, use g2_write_block_16,
-       otherwise, use g2_write_block_8. */
-    if(!((uint32_t)pkt & 0x03)) {
-        g2_write_block_32((uint32_t *) pkt, txdesc[rtl.cur_tx], (len + 3) >> 2);
-    }
-    else if(!((uint32_t)pkt & 0x01)) {
-        g2_write_block_16((uint16_t *) pkt, txdesc[rtl.cur_tx], (len + 1) >> 1);
-    }
-    else {
-        g2_write_block_8(pkt, txdesc[rtl.cur_tx], len);
-    }
+    assert(__is_aligned((uintptr_t)pkt, 32));
+    g2_write_block_32((uint32_t *) pkt, txdesc[rtl.cur_tx], (len + 3) >> 2);
 
     /* All packets must be at least 60 bytes, pad them with null bytes if
        they are not already of an appropriate size. */
@@ -672,14 +628,10 @@ int bba_tx(const uint8_t *pkt, int len, int wait) {
     if(!__is_defined(TX_SEMA))
         return bba_rtx(pkt, len, wait);
 
-    if(irq_inside_int()) {
-        if(sem_trywait(&tx_sema)) {
-            //printf("bba_tx called from an irq while a thread was running it !\n");
-            return BBA_TX_OK;   /* sorry guys ... */
-        }
+    if(sem_wait_irqsafe(&tx_sema)) {
+        //printf("bba_tx called from an irq while a thread was running it !\n");
+        return BBA_TX_OK;   /* sorry guys ... */
     }
-    else
-        sem_wait(&tx_sema);
 
     res = bba_rtx(pkt, len, wait);
     sem_signal(&tx_sema);
@@ -687,43 +639,18 @@ int bba_tx(const uint8_t *pkt, int len, int wait) {
     return res;
 }
 
-void bba_lock(void) {
-    //sem_wait(&bba_rx_sema2);
-    //asic_evt_disable(ASIC_EVT_EXP_PCI, BBA_ASIC_IRQ);
+static void bba_rx_process(void) {
+    /* Call the callback to process it */
+    eth_rx_callback(rx_pkt[rxout].rxbuff + rx_pkt[rxout].offt, rx_pkt[rxout].pkt_size);
+
+    rxout = (rxout + 1) % MAX_PKTS;
 }
 
-void bba_unlock(void) {
-    //asic_evt_enable(ASIC_EVT_EXP_PCI, BBA_ASIC_IRQ);
-    //sem_signal(&bba_rx_sema2);
-}
-
-static void *bba_rx_threadfunc(void *dummy) {
+static void bba_rx_worker(void *dummy) {
     (void)dummy;
 
-    while(!bba_rx_exit_thread) {
-        //sem_wait_timed(&bba_rx_sema, 500);
-        sem_wait(&bba_rx_sema);
-
-        if(bba_rx_exit_thread)
-            break;
-
-        bba_lock();
-
-        if(rxout != rxin) {
-
-            /* Call the callback to process it */
-            eth_rx_callback(rx_pkt[rxout].rxbuff, rx_pkt[rxout].pkt_size);
-
-            rxout = (rxout + 1) % MAX_PKTS;
-        }
-
-        bba_unlock();
-    }
-
-    bba_rx_exit_thread = 0;
-
-    printf("bba_rx_thread exiting ...\n");
-    return NULL;
+    while(rxout != rxin)
+        bba_rx_process();
 }
 
 static void bba_rx(void) {
@@ -773,7 +700,7 @@ static void bba_link_change(void) {
         dbglog(DBG_INFO, "bba: link stable\n");
 
         // The link is back.
-        link_stable = 1;
+        link_stable = true;
     }
     else {
         dbglog(DBG_INFO, "bba: link lost\n");
@@ -785,7 +712,7 @@ static void bba_link_change(void) {
                     RT_MII_AN_START);
 
         // The link is gone.
-        link_stable = 0;
+        link_stable = false;
     }
 }
 
@@ -902,9 +829,12 @@ static int bba_if_shutdown(netif_t *self) {
     return 0;
 }
 
-static int bba_if_start(netif_t *self) {
-    int i;
+static const kthread_attr_t bba_rx_worker_attr = {
+    .label = "bba-rx-worker",
+    .prio = 1,
+};
 
+static int bba_if_start(netif_t *self) {
     (void)self;
 
     if(!(bba_if.flags & NETIF_INITIALIZED))
@@ -914,25 +844,15 @@ static int bba_if_start(netif_t *self) {
         return 0;
 
     // Start the BBA RX thread.
-    assert(bba_rx_thread == NULL);
-    sem_init(&bba_rx_sema, 0);
-    sem_init(&bba_rx_sema2, 1);
-    bba_rx_thread = thd_create(0, bba_rx_threadfunc, 0);
-    bba_rx_thread->prio = 1;
-    thd_set_label(bba_rx_thread, "BBA-rx-thd");
+    assert(rx_worker == NULL);
+    rx_worker = thd_worker_create_ex(&bba_rx_worker_attr, bba_rx_worker, NULL);
 
     /* We need something like this to get DHCP to work (since it doesn't
        know anything about an activated and yet not-yet-receiving network
        adapter =) */
-    /* Spin until the link is stabilized */
-    i = 1000;
 
-    while(!link_stable && i > 0) {
-        i--;
-        thd_sleep(10);
-    }
-
-    if(!link_stable) {
+    /* Wait until the link is stabilized */
+    if(!thd_poll(bba_link_is_stable, &link_stable, 10000)) {
         dbglog(DBG_ERROR, "bba: timed out waiting for link to stabilize\n");
         return -1;
     }
@@ -948,15 +868,10 @@ static int bba_if_stop(netif_t *self) {
         return 0;
 
     /* VP : Shutdown rx thread */
-    assert(bba_rx_thread != NULL);
-    bba_rx_exit_thread = 1;
-    sem_signal(&bba_rx_sema);
-    sem_signal(&bba_rx_sema2);
-    thd_join(bba_rx_thread, NULL);
-    sem_destroy(&bba_rx_sema);
-    sem_destroy(&bba_rx_sema2);
+    assert(rx_worker != NULL);
+    thd_worker_destroy(rx_worker);
 
-    bba_rx_thread = NULL;
+    rx_worker = NULL;
 
     bba_if.flags &= ~NETIF_RUNNING;
     return 0;
@@ -994,12 +909,8 @@ static int bba_if_rx_poll(netif_t *self) {
         g2_write_16(NIC(RT_INTRSTATUS), RT_INT_RX_ACK);
     }
 
-    if(rxout != rxin) {
-        /* Call the callback to process it */
-        eth_rx_callback(rx_pkt[rxout].rxbuff, rx_pkt[rxout].pkt_size);
-
-        rxout = (rxout + 1) % MAX_PKTS;
-    }
+    if(rxout != rxin)
+        bba_rx_process();
 
     return 0;
 }
@@ -1100,7 +1011,7 @@ int bba_init(void) {
     // Note: The thread itself is not created here, but when we actually
     // activate the adapter. This way we don't have a spare thread
     // laying around unless it's actually needed.
-    bba_rx_thread = NULL;
+    rx_worker = NULL;
 
     /* Setup the structure */
     bba_if.name = "bba";
