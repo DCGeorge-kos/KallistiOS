@@ -23,8 +23,8 @@ vertex DMA usage as well as showing off interleaved polygon type usage, etc.
 */
 
 // These are in perfmeter.c
-void pm_init();
-void pm_draw();
+void pm_init(void);
+void pm_draw(void);
 
 /* Draws a sphere out of GL_QUADS according to the syntax of glutSolidSphere
 
@@ -111,7 +111,7 @@ static void sphere(sphere_t *s) { /* {{{ */
     }
 }
 
-static void draw_sphere(sphere_t *s, int list) {
+static void draw_sphere(sphere_t *s, pvr_list_t list) {
     void * sqd;
     pvr_vertex_t *v, *vd;
 
