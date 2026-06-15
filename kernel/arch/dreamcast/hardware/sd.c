@@ -22,11 +22,18 @@
 #include <kos/net.h>
 
 #include <kos/blockdev.h>
+#include <kos/timer.h>
+#include <kos/thread.h>
 #include <kos/dbglog.h>
 
-#define MAX_RETRIES     5000
-#define READ_RETRIES    50000
-#define WRITE_RETRIES   50000
+#define MAX_RETRIES       5000
+#define READ_RETRIES      50000
+
+/* SD spec allows a card to signal busy for up to 500ms */
+#define READY_TIMEOUT_MS  500
+
+/* Spin for a 200us before yielding */
+#define SD_SPIN_US  200
 
 #define CMD(n) ((n) | 0x40)
 
@@ -109,10 +116,10 @@ static uint8_t sci_rw_byte(uint8_t data) {
     return rx;
 }
 
-static bool current_speed = false; /* false = slow, true = fast */
+static bool fast_mode = false; /* false = slow, true = fast */
 
 static uint8_t scif_rw_byte_wrapper(uint8_t data) {
-    if(current_speed)
+    if(fast_mode)
         return scif_spi_rw_byte(data);
     else
         return scif_spi_slow_rw_byte(data);
@@ -124,9 +131,7 @@ static int scif_read_data_wrapper(uint8_t *data, size_t len) {
 }
 
 static int scif_write_data_wrapper(const uint8_t *data, size_t len) {
-    while(len--) {
-        scif_spi_write_byte(*data++);
-    }
+    scif_spi_write_data(data, len);
     return 0;
 }
 
@@ -163,7 +168,7 @@ static void sci_shutdown_wrapper(void) {
 }
 
 static int scif_init_wrapper(bool fast) {
-    current_speed = fast;
+    fast_mode = fast;
     return scif_spi_init();
 }
 
@@ -176,20 +181,35 @@ static int sci_init_wrapper(bool fast) {
     return sci_init(baud, SCI_MODE_SPI, SCI_CLK_INT, 512);
 }
 
+static int sd_ready_cb(void *d) {
+    (void)d;
+    return spi_rw_byte(0xFF) == 0xFF;
+}
+
+static int sd_wait_ready(void) {
+    uint64_t now = timer_us_gettime64();
+    uint64_t spin_deadline = now + SD_SPIN_US;
+
+    spi_rw_byte(0xFF);
+
+    /* Fast path: the card is almost always ready within ~12-44us. */
+    do {
+        if(spi_rw_byte(0xFF) == 0xFF)
+            return 0;
+    } while(timer_us_gettime64() < spin_deadline);
+
+    /* Slow path: yield instead of burning CPU. */
+    return thd_poll(sd_ready_cb, NULL, READY_TIMEOUT_MS) ? 0 : -1;
+}
+
 static int sd_send_cmd(uint8_t cmd, uint32_t arg) {
     uint8_t rv;
-    int i = 0;
+    int i;
     uint8_t pkt[6];
 
-    /* Wait for the SD card to be ready to accept our command... */
-    spi_rw_byte(0xFF);
-    do {
-        rv = spi_rw_byte(0xFF);
-        ++i;
-    } while(rv != 0xFF && i < MAX_RETRIES);
-
-    /* If we never got a response, something's wrong... bail out */
-    if(rv != 0xFF)
+    /* Wait for the SD card to be ready to accept our command. If it never
+       becomes ready, something's wrong... bail out */
+    if(sd_wait_ready())
         return -1;
 
     /* Pack up the packet */
@@ -432,22 +452,13 @@ int sd_init_ex(const sd_init_params_t *params) {
 }
 
 int sd_shutdown(void) {
-    int i = 0;
-    uint8_t rv;
-
     if(!initted)
         return -1;
 
     /* Select, wait for ready, deselect, and make sure it releases the data
        line. */
     spi_set_cs(true);
-
-    spi_rw_byte(0xFF);
-    do {
-        rv = spi_rw_byte(0xFF);
-        ++i;
-    } while(rv != 0xFF && i < MAX_RETRIES);
-
+    sd_wait_ready();
     spi_set_cs(false);
     spi_rw_byte(0xFF);
     spi_shutdown();
@@ -560,17 +571,10 @@ out:
 
 static int write_data(uint8_t tag, size_t bytes, const uint8_t *buf) {
     uint8_t rv;
-    int i = 0;
     uint16_t crc;
 
     /* Wait for the card to be ready for our data */
-    spi_rw_byte(0xFF);
-    do {
-        rv = spi_rw_byte(0xFF);
-        ++i;
-    } while(rv != 0xFF && i < WRITE_RETRIES);
-
-    if(rv != 0xFF)
+    if(sd_wait_ready())
         return -1;
 
     spi_write_byte(tag);
@@ -594,8 +598,7 @@ static int write_data(uint8_t tag, size_t bytes, const uint8_t *buf) {
 }
 
 int sd_write_blocks(uint32_t block, size_t count, const uint8_t *buf) {
-    int rv, i = 0;
-    uint8_t byte;
+    int rv;
     size_t write_count;
     const uint8_t *write_buf;
     bool retried = false;
@@ -656,19 +659,14 @@ write_blocks:
             write_buf += 512;
         }
 
-        /* Write the end data token. */
-        spi_rw_byte(0xFF);
-        do {
-            byte = spi_rw_byte(0xFF);
-            ++i;
-        } while(byte != 0xFF && i < WRITE_RETRIES);
-
-        if(byte != 0xFF) {
+        /* Wait for the last block to finish programming */
+        if(sd_wait_ready()) {
             rv = -1;
             errno = EIO;
             goto out;
         }
 
+        /* Write the end data token. */
         spi_rw_byte(0xFD);
     }
 
