@@ -106,52 +106,47 @@ int genwait_wait(void *obj, const char *mesg, unsigned int timeout) {
 }
 
 /* Removes a thread from its wait queue; assumes ints are disabled. */
-static void __nonnull_all genwait_unqueue(kthread_t *thd) {
-    if(thd->wait_obj) {
-        /* Remove it from the queue */
-        TAILQ_REMOVE(&slpque[LOOKUP(thd->wait_obj)], thd, thdq);
+static void __nonnull_all genwait_unqueue(kthread_t *thd, int err) {
 
-        /* Also remove it from the timer queue if applicable */
-        if(thd->wait_timeout)
-            tq_remove(thd);
-
-        /* Clean up wait stuff */
-        thd->wait_obj = NULL;
-        thd->wait_msg = NULL;
-        thd->wait_timeout = 0;
-
-        /* Make it runnable again */
-        thd->state = STATE_READY;
-        thd_add_to_runnable(thd, 0);
+    /* Set the wake return value */
+    if(err) {
+        CONTEXT_RET(thd->context) = -1;
+        thd->thd_errno = err;
     }
+    else {
+        CONTEXT_RET(thd->context) = 0;
+    }
+
+    /* Remove it from the queue */
+    TAILQ_REMOVE(&slpque[LOOKUP(thd->wait_obj)], thd, thdq);
+
+    /* Also remove it from the timer queue if applicable */
+    if(thd->wait_timeout)
+        tq_remove(thd);
+
+    /* Clean up wait stuff */
+    thd->wait_obj = NULL;
+    thd->wait_msg = NULL;
+    thd->wait_timeout = 0;
+
+    /* Make it runnable again */
+    thd->state = STATE_READY;
+    thd_add_to_runnable(thd, 0);
 }
 
 static int genwait_wake_thd_cnt(const void *obj, int cntmax, kthread_t *thd, int err) {
-    kthread_t       * t, * nt;
-    struct slpquehead   * qp;
+    kthread_t       *t, *nt;
     int         cnt = 0;
 
     /* Twiddle interrupt state */
     irq_disable_scoped();
 
-    /* Find the queue */
-    qp = &slpque[LOOKUP(obj)];
-
     /* Go through and find any matching entries */
-    TAILQ_FOREACH_SAFE(t, qp, thdq, nt) {
+    TAILQ_FOREACH_SAFE(t, &slpque[LOOKUP(obj)], thdq, nt) {
         /* Is this thread a match? */
         if(t->wait_obj == obj && (!thd || t == thd)) {
             /* Yes, remove it from the wait queue */
-            genwait_unqueue(t);
-
-            /* Set the wake return value */
-            if(err) {
-                CONTEXT_RET(t->context) = -1;
-                t->thd_errno = err;
-            }
-            else {
-                CONTEXT_RET(t->context) = 0;
-            }
+            genwait_unqueue(t, err);
 
             /* Check to see if we've filled our quota */
             if(cntmax > 0) {
@@ -193,30 +188,19 @@ int genwait_wake_thd(const void *obj, kthread_t *thd, int err) {
 void genwait_check_timeouts(uint64_t tm) {
     kthread_t   *t;
 
-    t = tq_next();
-
-    while(t) {
+    while((t = tq_next())) {
         /* If the next timeout is beyond our current time, then
            forget about it. */
         if(t->wait_timeout > tm)
             return;
 
-        /* Set an error code */
-        t->thd_errno = EAGAIN;  /* This is fairly close */
-        CONTEXT_RET(t->context) = -1;
-
-        /* Re-activate it */
-        genwait_unqueue(t);
-
-        /* Get the next one */
-        t = tq_next();
+        /* Re-activate it with an error code */
+        genwait_unqueue(t, EAGAIN);
     }
 }
 
 uint64_t genwait_next_timeout(void) {
-    kthread_t *t;
-
-    t = tq_next();
+    kthread_t *t = tq_next();
 
     if(t == NULL)
         return 0;
@@ -225,9 +209,7 @@ uint64_t genwait_next_timeout(void) {
 }
 
 int genwait_init(void) {
-    int i;
-
-    for(i = 0; i < TABLESIZE; i++)
+    for(size_t i = 0; i < TABLESIZE; i++)
         TAILQ_INIT(&slpque[i]);
 
     TAILQ_INIT(&timer_queue);
