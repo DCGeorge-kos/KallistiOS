@@ -1,6 +1,6 @@
 /* KallistiOS ##version##
 
-   maple_init.c
+   maple_init_shutdown.c
    Copyright (C) 2002 Megan Potter
  */
 
@@ -187,6 +187,7 @@ void maple_hw_shutdown(void) {
             cnt += !maple_driver_detach(p, u);
 
             free(maple_state.ports[p].units[u]);
+            maple_state.ports[p].units[u] = NULL;
         }
     }
 
