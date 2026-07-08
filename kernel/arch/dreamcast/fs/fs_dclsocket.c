@@ -43,7 +43,6 @@
 
 #define DCLOAD_PORT 53535
 #define DCLOAD_PACKET_SIZE 1440
-#define NAME "dcload-ip over KOS sockets"
 
 /* Number of DCLOAD_PACKET_SIZE chunks needed to cover n bytes. */
 #define DCLOAD_PACKETS(n)  (((n) + DCLOAD_PACKET_SIZE - 1) / DCLOAD_PACKET_SIZE)
@@ -52,9 +51,6 @@
 #define DCLOAD_MAP_ENTRIES DCLOAD_PACKETS(16 * 1024 * 1024)
 #define DCLOAD_MAP_BYTES   (((DCLOAD_MAP_ENTRIES) + 7) / 8)
 
-/* dc-tool hands back big handles for opendir() but small ones for files, so any
-   handle past this cutoff is a directory. */
-#define FS_DCLSOCKET_FD_DIR_THRESH 100
 
 typedef struct {
     unsigned char id[4];
@@ -81,12 +77,17 @@ static struct {
     unsigned char map[DCLOAD_MAP_BYTES];
 } bin_info;
 
+typedef struct dcl_obj {
+    int hnd;
+    char *path;
+    dirent_t dirent;
+} dcl_obj_t;
+
 extern int dcload_type;
 static int initted = 0;
-static int escape = 0;
+static bool escape = false;
 static int retval = 0;
 static mutex_t mutex;
-static char *dcload_path = NULL;
 static uint8_t pktbuf[DCLOAD_PACKET_SIZE + sizeof(command_t)];
 
 static int dcls_socket = -1;
@@ -177,17 +178,7 @@ static void dcls_handle_sbin(command_t *cmd) {
 static void dcls_handle_retv(command_t *cmd) {
     send(dcls_socket, cmd, sizeof(command_t), 0);
     retval = ntohl(cmd->address);
-    escape = 1;
-}
-
-static void dcls_handle_vers(command_t *cmd) {
-    command_t *resp = (command_t *)pktbuf;
-    int size = strlen(NAME) + 1 + sizeof(command_t);
-
-    memcpy(resp, cmd, sizeof(command_t));
-    strcpy((char *)resp->data, NAME);
-
-    send(dcls_socket, pktbuf, size, 0);
+    escape = true;
 }
 
 static void dcls_recv_loop(void) {
@@ -225,23 +216,29 @@ static void dcls_recv_loop(void) {
         else if(!memcmp(cmd->id, "DBIN", 4)) {
             dcls_handle_dbin(cmd);
         }
-        else if(!memcmp(cmd->id, "VERS", 4)) {
-            dcls_handle_vers(cmd);
-        }
     }
 
-    escape = 0;
+    escape = false;
 }
 
 static void *dcls_open(struct vfs_handler *vfs, const char *fn, int mode) {
     int hnd, dcload_mode = 0;
     int mm = (mode & O_MODE_MASK);
+    dcl_obj_t *entry;
     command_t *cmd = (command_t *)pktbuf;
 
     (void)vfs;
 
-    if(mutex_lock_irqsafe(&mutex))
+    entry = calloc(1, sizeof(dcl_obj_t));
+    if(!entry) {
+        errno = ENOMEM;
         return NULL;
+    }
+
+    if(mutex_lock(&mutex)) {
+        free(entry);
+        return NULL;
+    }
 
     if(mode & O_DIR) {
         char realfn[fn[0] ? strlen(fn) + 1 : 2];
@@ -261,20 +258,24 @@ static void *dcls_open(struct vfs_handler *vfs, const char *fn, int mode) {
         dcls_recv_loop();
         hnd = retval;
 
-        if(hnd) {
-            if(dcload_path)
-                free(dcload_path);
+        if(!hnd)                        /* opendir failed */
+            goto fail;
 
-            if(fn[strlen(realfn) - 1] == '/') {
-                dcload_path = (char *)malloc(strlen(realfn) + 1);
-                strcpy(dcload_path, realfn);
-            }
-            else {
-                dcload_path = (char *)malloc(strlen(realfn) + 2);
-                strcpy(dcload_path, realfn);
-                strcat(dcload_path, "/");
-            }
+        entry->hnd = hnd;
+
+        /* Keep a trailing-slash copy of the path for readdir(). */
+        size_t plen = strlen(realfn);
+        int add_slash = realfn[plen - 1] != '/';
+
+        entry->path = malloc(plen + add_slash + 1);
+        if(!entry->path) {
+            errno = ENOMEM;
+            goto fail;
         }
+
+        strcpy(entry->path, realfn);
+        if(add_slash)
+            strcat(entry->path, "/");
     }
     else {
         if(mm == O_RDONLY)
@@ -297,56 +298,64 @@ static void *dcls_open(struct vfs_handler *vfs, const char *fn, int mode) {
 
         send(dcls_socket, pktbuf, sizeof(command_t) + strlen(fn) + 1, 0);
         dcls_recv_loop();
-        hnd = retval + 1;
+
+        if(retval < 0)                  /* open failed */
+            goto fail;
+
+        entry->hnd = retval;
     }
 
     mutex_unlock(&mutex);
 
-    return (void *)hnd;
+    return entry;
+
+fail:
+    mutex_unlock(&mutex);
+    free(entry);
+    return NULL;
 }
 
 static int dcls_close(void *hnd) {
-    int fd = (int) hnd;
+    dcl_obj_t *obj = hnd;
     command_int_t *cmd = (command_int_t *)pktbuf;
 
-    if(mutex_lock_irqsafe(&mutex))
+    if(!obj)
+        return 0;
+
+    if(mutex_lock(&mutex))
         return -1;
 
-    if(fd > FS_DCLSOCKET_FD_DIR_THRESH) {
+    if(obj->path) {
         memcpy(cmd->id, "DC17", 4);
-        cmd->value0 = htonl(fd);
-
-        send(dcls_socket, cmd, sizeof(command_int_t), 0);
-        dcls_recv_loop();
+        free(obj->path);
     }
-    else if(fd) {
-        --fd;
-
+    else {
         memcpy(cmd->id, "DC05", 4);
-        cmd->value0 = htonl(fd);
-
-        send(dcls_socket, cmd, sizeof(command_int_t), 0);
-        dcls_recv_loop();
     }
+
+    cmd->value0 = htonl(obj->hnd);
+
+    send(dcls_socket, cmd, sizeof(command_int_t), 0);
+    dcls_recv_loop();
+
+    free(obj);
 
     mutex_unlock(&mutex);
     return 0;
 }
 
 static ssize_t dcls_read(void *hnd, void *buf, size_t cnt) {
-    uint32_t fd = (uint32_t) hnd;
+    dcl_obj_t *obj = hnd;
     command_3int_t *cmd = (command_3int_t *)pktbuf;
 
-    if(!fd)
+    if(!obj)
         return -1;
 
-    if(mutex_lock_irqsafe(&mutex))
+    if(mutex_lock(&mutex))
         return -1;
-
-    --fd;
 
     memcpy(cmd->id, "DC03", 4);
-    cmd->value0 = htonl(fd);
+    cmd->value0 = htonl(obj->hnd);
     cmd->value1 = htonl((uint32_t) buf);
     cmd->value2 = htonl((uint32_t) cnt);
 
@@ -359,19 +368,17 @@ static ssize_t dcls_read(void *hnd, void *buf, size_t cnt) {
 }
 
 static ssize_t dcls_write(void *hnd, const void *buf, size_t cnt) {
-    uint32_t fd = (uint32_t) hnd;
+    dcl_obj_t *obj = hnd;
     command_3int_t *cmd = (command_3int_t *)pktbuf;
 
-    if(!fd)
+    if(!obj)
         return -1;
 
-    if(mutex_lock_irqsafe(&mutex))
+    if(mutex_lock(&mutex))
         return -1;
-
-    --fd;
 
     memcpy(cmd->id, "DD02", 4);
-    cmd->value0 = htonl(fd);
+    cmd->value0 = htonl(obj->hnd);
     cmd->value1 = htonl((uint32_t) buf);
     cmd->value2 = htonl(cnt);
 
@@ -384,19 +391,17 @@ static ssize_t dcls_write(void *hnd, const void *buf, size_t cnt) {
 }
 
 static off_t dcls_seek(void *hnd, off_t offset, int whence) {
-    uint32_t fd = (uint32_t)hnd;
+    dcl_obj_t *obj = hnd;
     command_3int_t *command = (command_3int_t *)pktbuf;
 
-    if(!hnd)
+    if(!obj)
         return -1;
 
-    if(mutex_lock_irqsafe(&mutex))
+    if(mutex_lock(&mutex))
         return -1;
-
-    --fd;
 
     memcpy(command->id, "DC11", 4);
-    command->value0 = htonl(fd);
+    command->value0 = htonl(obj->hnd);
     command->value1 = htonl((uint32_t)offset);
     command->value2 = htonl((uint32_t)whence);
 
@@ -422,8 +427,6 @@ static size_t dcls_total(void *hnd) {
     return ret;
 }
 
-static dirent_t their_dir;
-
 /* The host fills the readdir reply as a POSIX struct dirent, not a KOS
    dirent_t, so receive it as one */
 static union {
@@ -432,19 +435,19 @@ static union {
 } our_dir;
 
 static const dirent_t *dcls_readdir(void *hnd) {
-    uint32_t fd = (uint32_t) hnd;
+    dcl_obj_t *entry = hnd;
     command_3int_t *cmd = (command_3int_t *)pktbuf;
 
-    if(fd < FS_DCLSOCKET_FD_DIR_THRESH) {
+    if(!entry || !entry->path) {
         errno = EBADF;
         return NULL;
     }
 
-    if(mutex_lock_irqsafe(&mutex))
+    if(mutex_lock(&mutex))
         return NULL;
 
     memcpy(cmd->id, "DC18", 4);
-    cmd->value0 = htonl(fd);
+    cmd->value0 = htonl(entry->hnd);
     cmd->value1 = htonl((uint32_t)(&our_dir.de));
     cmd->value2 = htonl(sizeof(our_dir));
 
@@ -455,6 +458,7 @@ static const dirent_t *dcls_readdir(void *hnd) {
     if(retval) {
         command_t *cmd2 = (command_t *)pktbuf;
         dcload_stat_t filestat;
+        dirent_t *rv = &entry->dirent;
 
         /* Verify dcload won't overflow us */
         if(strlen(our_dir.de.d_name) + 1 > NAME_MAX) {
@@ -463,14 +467,14 @@ static const dirent_t *dcls_readdir(void *hnd) {
             return NULL;
         }
 
-        char fn[strlen(dcload_path) + strlen(our_dir.de.d_name) + 1];
+        char fn[strlen(entry->path) + strlen(our_dir.de.d_name) + 1];
 
-        strcpy(their_dir.name, our_dir.de.d_name);
-        their_dir.size = 0;
-        their_dir.time = 0;
-        their_dir.attr = 0;
+        strcpy(rv->name, our_dir.de.d_name);
+        rv->size = 0;
+        rv->time = 0;
+        rv->attr = 0;
 
-        strcpy(fn, dcload_path);
+        strcpy(fn, entry->path);
         strcat(fn, our_dir.de.d_name);
 
         memcpy(cmd2->id, "DC13", 4);
@@ -484,18 +488,18 @@ static const dirent_t *dcls_readdir(void *hnd) {
 
         if(!retval) {
             if(filestat.st_mode & S_IFDIR) {
-                their_dir.size = -1;
-                their_dir.attr = O_DIR;
+                rv->size = -1;
+                rv->attr = O_DIR;
             }
             else {
-                their_dir.size = filestat.st_size;
+                rv->size = filestat.st_size;
             }
 
-            their_dir.time = filestat.mtime;
+            rv->time = filestat.mtime;
         }
 
         mutex_unlock(&mutex);
-        return &their_dir;
+        return rv;
     }
 
     mutex_unlock(&mutex);
@@ -507,7 +511,7 @@ static int dcls_rename(vfs_handler_t *vfs, const char *fn1, const char *fn2) {
 
     (void)vfs;
 
-    if(mutex_lock_irqsafe(&mutex))
+    if(mutex_lock(&mutex))
         return -1;
 
     memcpy(pktbuf, "DC07", 4);
@@ -537,7 +541,7 @@ static int dcls_unlink(vfs_handler_t *vfs, const char *fn) {
 
     (void)vfs;
 
-    if(mutex_lock_irqsafe(&mutex))
+    if(mutex_lock(&mutex))
         return -1;
 
     memcpy(pktbuf, "DC08", 4);
@@ -552,8 +556,7 @@ static int dcls_unlink(vfs_handler_t *vfs, const char *fn) {
     return retval;
 }
 
-static int dcls_stat(vfs_handler_t *vfs, const char *path, struct stat *st,
-                     int flag) {
+static int dcls_stat(vfs_handler_t *vfs, const char *path, struct stat *st, int flag) {
     command_t *cmd = (command_t *)pktbuf;
     dcload_stat_t filestat = { 0 };
     size_t len = strlen(path);
@@ -571,7 +574,7 @@ static int dcls_stat(vfs_handler_t *vfs, const char *path, struct stat *st,
         return 0;
     }
 
-    if(mutex_lock_irqsafe(&mutex))
+    if(mutex_lock(&mutex))
         return -1;
 
     memcpy(cmd->id, "DC13", 4);
@@ -608,19 +611,19 @@ static int dcls_stat(vfs_handler_t *vfs, const char *path, struct stat *st,
 }
 
 static int dcls_rewinddir(void *hnd) {
-    uint32_t fd = (uint32_t) hnd;
+    dcl_obj_t *obj = hnd;
     command_int_t *cmd = (command_int_t *)pktbuf;
 
-    if(fd < FS_DCLSOCKET_FD_DIR_THRESH) {
+    if(!obj || !obj->path) {
         errno = EBADF;
         return -1;
     }
 
-    if(mutex_lock_irqsafe(&mutex))
+    if(mutex_lock(&mutex))
         return -1;
 
     memcpy(cmd->id, "DC21", 4);
-    cmd->value0 = htonl(fd);
+    cmd->value0 = htonl(obj->hnd);
 
     send(dcls_socket, cmd, sizeof(command_int_t), 0);
 
@@ -656,7 +659,30 @@ static int dcls_writebuf(const uint8_t *buf, int len, int xlat) {
         return -1;
 
     memcpy(cmd.id, "DD02", 4);
-    cmd.value0 = htonl(1);
+    cmd.value0 = htonl(STDOUT_FILENO);
+    cmd.value1 = htonl((uint32_t) buf);
+    cmd.value2 = htonl(len);
+
+    send(dcls_socket, &cmd, sizeof(cmd), 0);
+
+    dcls_recv_loop();
+
+    mutex_unlock(&mutex);
+
+    return retval;
+}
+
+static int dcls_readbuf(uint8_t *buf, int len) {
+    command_3int_t cmd;
+
+    if(initted < 2)
+        return -1;
+
+    if(mutex_lock(&mutex))
+        return -1;
+
+    memcpy(cmd.id, "DC03", 4);
+    cmd.value0 = htonl(STDIN_FILENO);
     cmd.value1 = htonl((uint32_t) buf);
     cmd.value2 = htonl(len);
 
@@ -742,7 +768,8 @@ dbgio_handler_t dbgio_dcls = {
     .detected = dcls_detected,
     .init = dcls_fake_init,
     .shutdown = dcls_fake_shutdown,
-    .write_buffer = dcls_writebuf
+    .write_buffer = dcls_writebuf,
+    .read_buffer = dcls_readbuf
 };
 
 /* This function must be called prior to calling fs_dclsocket_init() */
@@ -754,7 +781,6 @@ void fs_dclsocket_init_console(void) {
 
     dbgio_dcls.set_irq_usage = dbgio_null.set_irq_usage;
     dbgio_dcls.flush = dbgio_null.flush;
-    dbgio_dcls.read_buffer = dbgio_null.read_buffer;
 
     initted = 1;
 }

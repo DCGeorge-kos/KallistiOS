@@ -61,6 +61,7 @@ struct udp_sock {
     int domain;
     int proto;
     int hop_limit;
+    int tos;
     file_t sock;
 
     struct {
@@ -79,7 +80,7 @@ static net_udp_stats_t udp_stats = { 0 };
 
 static int net_udp_send_raw(netif_t *net, const struct sockaddr_in6 *src,
                             const struct sockaddr_in6 *dst, const uint8_t *data,
-                            size_t size, uint32_t flags, int hops,
+                            size_t size, uint32_t flags, int hops, int tos,
                             uint32_t iflags, int proto, uint16_t cscov);
 
 static int net_udp_accept(net_socket_t *hnd, struct sockaddr *addr,
@@ -411,7 +412,7 @@ static ssize_t net_udp_sendto(net_socket_t *hnd, const void *message,
     struct sockaddr_in *realaddr;
     struct sockaddr_in6 realaddr6;
     uint32_t sflags, iflags;
-    int hops, proto;
+    int hops, proto, tos;
     uint16_t cscov;
     struct sockaddr_in6 local_addr;
 
@@ -506,11 +507,12 @@ static ssize_t net_udp_sendto(net_socket_t *hnd, const void *message,
     iflags = udpsock->int_flags;
     hops = udpsock->hop_limit;
     proto = udpsock->proto;
+    tos = udpsock->tos;
     cscov = udpsock->udp_lite.send_cscov;
     mutex_unlock(&udp_mutex);
 
     return net_udp_send_raw(NULL, &local_addr, &realaddr6,
-                            (const uint8_t *)message, length, sflags, hops,
+                            (const uint8_t *)message, length, sflags, hops, tos,
                             iflags, proto, cscov);
 err:
     mutex_unlock(&udp_mutex);
@@ -652,6 +654,9 @@ static int net_udp_getsockopt(net_socket_t *hnd, int level, int option_name,
                 case IP_TTL:
                     tmp = sock->hop_limit;
                     goto copy_int;
+                case IP_TOS:
+                    tmp = sock->tos;
+                    goto copy_int;
             }
 
             break;
@@ -772,6 +777,19 @@ static int net_udp_setsockopt(net_socket_t *hnd, int level, int option_name,
                         sock->hop_limit = UDP_DEFAULT_HOPS;
                     else
                         sock->hop_limit = tmp;
+
+                    goto ret_success;
+
+                case IP_TOS:
+                    if(option_len != sizeof(int))
+                        goto ret_inval;
+
+                    tmp = *((int *)option_value);
+
+                    if(tmp < 0 || tmp > 255)
+                        goto ret_inval;
+                    else
+                        sock->tos = tmp;
 
                     goto ret_success;
             }
@@ -1222,9 +1240,13 @@ static int net_udp_input4(netif_t *src, const ip_hdr_t *ip, const uint8_t *data,
         TAILQ_INSERT_TAIL(&sock->packets, pkt, pkt_queue);
 
         ++udp_stats.pkt_recv;
-        __poll_event_trigger(sock->sock, POLLRDNORM);
         genwait_wake_one(sock);
+
+        /* Fire poll wakeups after releasing udp_mutex to avoid the
+           poll-mutex / udp_mutex ABBA deadlock. */
+        file_t poll_fd = sock->sock;
         mutex_unlock(&udp_mutex);
+        __poll_event_trigger(poll_fd, POLLRDNORM);
 
         return 0;
     }
@@ -1358,9 +1380,13 @@ static int net_udp_input6(netif_t *src, const ipv6_hdr_t *ip, const uint8_t *dat
         TAILQ_INSERT_TAIL(&sock->packets, pkt, pkt_queue);
 
         ++udp_stats.pkt_recv;
-        __poll_event_trigger(sock->sock, POLLRDNORM);
         genwait_wake_one(sock);
+
+        /* Fire poll wakeups after releasing udp_mutex to avoid the
+           poll-mutex / udp_mutex ABBA deadlock. */
+        file_t poll_fd = sock->sock;
         mutex_unlock(&udp_mutex);
+        __poll_event_trigger(poll_fd, POLLRDNORM);
 
         return 0;
     }
@@ -1387,7 +1413,7 @@ static int net_udp_input(netif_t *src, int domain, const void *hdr,
 /* XXX */
 static int net_udp_send_raw(netif_t *net, const struct sockaddr_in6 *src,
                             const struct sockaddr_in6 *dst, const uint8_t *data,
-                            size_t size, uint32_t flags, int hops,
+                            size_t size, uint32_t flags, int hops, int tos,
                             uint32_t iflags, int proto, uint16_t cscov) {
     uint8_t buf[size + sizeof(udp_hdr_t)];
     udp_hdr_t *hdr = (udp_hdr_t *)buf;
@@ -1464,7 +1490,7 @@ static int net_udp_send_raw(netif_t *net, const struct sockaddr_in6 *src,
     }
 
     /* Pass everything off to the network layer to do the rest. */
-    err = net_ipv6_send(net, buf, size, hops, proto, &srcaddr,
+    err = net_ipv6_send(net, buf, size, hops, tos, proto, &srcaddr,
                         &dst->sin6_addr);
 
     if(err < 0) {
